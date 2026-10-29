@@ -430,6 +430,11 @@ struct service_notifier_context {
 	void *handle;
 	uint32_t instance_id;
 	char name[QMI_SERVREG_LOC_NAME_LENGTH_V01 + 1];
+	/* One notifier_block per domain: a single block cannot be a member of
+	 * several notifier chains, its ->next pointer is per-chain state.
+	 */
+	struct notifier_block nb;
+	struct icnss_priv *priv;
 };
 
 static struct icnss_priv {
@@ -473,7 +478,6 @@ static struct icnss_priv {
 	struct icnss_stats stats;
 	struct work_struct service_notifier_work;
 	struct service_notifier_context *service_notifier;
-	struct notifier_block service_notifier_nb;
 	int total_domains;
 	struct notifier_block get_service_nb;
 	void *modem_notify_handler;
@@ -2605,7 +2609,7 @@ static int icnss_pdr_unregister_notifier(struct icnss_priv *priv)
 	for (i = 0; i < priv->total_domains; i++)
 		service_notif_unregister_notifier(
 				priv->service_notifier[i].handle,
-				&priv->service_notifier_nb);
+				&priv->service_notifier[i].nb);
 
 	kfree(priv->service_notifier);
 
@@ -2617,8 +2621,9 @@ static int icnss_pdr_unregister_notifier(struct icnss_priv *priv)
 static int icnss_service_notifier_notify(struct notifier_block *nb,
 					 unsigned long notification, void *data)
 {
-	struct icnss_priv *priv = container_of(nb, struct icnss_priv,
-					       service_notifier_nb);
+	struct service_notifier_context *notif_ctx =
+		container_of(nb, struct service_notifier_context, nb);
+	struct icnss_priv *priv = notif_ctx->priv;
 	enum pd_subsys_state *state = data;
 	struct icnss_event_pd_service_down_data *event_data;
 	struct icnss_uevent_fw_down_data fw_down_data;
@@ -2692,6 +2697,7 @@ static int icnss_get_service_location_notify(struct notifier_block *nb,
 	int ret;
 	int i;
 	struct service_notifier_context *notifier;
+	int registered = 0;
 
 	icnss_pr_dbg("Get service notify opcode: %lu, state: 0x%lx\n", opcode,
 		     priv->state);
@@ -2713,32 +2719,53 @@ static int icnss_get_service_location_notify(struct notifier_block *nb,
 		goto out;
 	}
 
-	priv->service_notifier_nb.notifier_call = icnss_service_notifier_notify;
-
 	for (i = 0; i < pd->total_domains; i++) {
+		int j;
+
 		icnss_pr_dbg("%d: domain_name: %s, instance_id: %d\n", i,
 			     pd->domain_list[i].name,
 			     pd->domain_list[i].instance_id);
 
-		notifier[i].handle =
-			service_notif_register_notifier(pd->domain_list[i].name,
-				pd->domain_list[i].instance_id,
-				&priv->service_notifier_nb, &curr_state);
-		notifier[i].instance_id = pd->domain_list[i].instance_id;
-		strlcpy(notifier[i].name, pd->domain_list[i].name,
+		/* Deduplicate: the same domain twice would register the same
+		 * notifier chain entry twice, corrupting the chain.
+		 */
+		for (j = 0; j < registered; j++)
+			if (notifier[j].instance_id ==
+					pd->domain_list[i].instance_id &&
+			    !strcmp(notifier[j].name, pd->domain_list[i].name))
+				break;
+
+		if (j < registered) {
+			icnss_pr_dbg("%d: skipping duplicate domain %s(0x%x)\n",
+				     i, pd->domain_list[i].name,
+				     pd->domain_list[i].instance_id);
+			continue;
+		}
+
+		notifier[registered].nb.notifier_call =
+						icnss_service_notifier_notify;
+		notifier[registered].priv = priv;
+		notifier[registered].instance_id = pd->domain_list[i].instance_id;
+		strlcpy(notifier[registered].name, pd->domain_list[i].name,
 			QMI_SERVREG_LOC_NAME_LENGTH_V01 + 1);
 
-		if (IS_ERR(notifier[i].handle)) {
+		notifier[registered].handle =
+			service_notif_register_notifier(pd->domain_list[i].name,
+				pd->domain_list[i].instance_id,
+				&notifier[registered].nb, &curr_state);
+
+		if (IS_ERR(notifier[registered].handle)) {
 			icnss_pr_err("%d: Unable to register notifier for %s(0x%x)\n",
-				     i, pd->domain_list->name,
-				     pd->domain_list->instance_id);
-			ret = PTR_ERR(notifier[i].handle);
+				     i, pd->domain_list[i].name,
+				     pd->domain_list[i].instance_id);
+			ret = PTR_ERR(notifier[registered].handle);
 			goto free_handle;
 		}
+		registered++;
 	}
 
 	priv->service_notifier = notifier;
-	priv->total_domains = pd->total_domains;
+	priv->total_domains = registered;
 
 	set_bit(ICNSS_PDR_REGISTERED, &priv->state);
 
@@ -2748,11 +2775,9 @@ static int icnss_get_service_location_notify(struct notifier_block *nb,
 	return NOTIFY_OK;
 
 free_handle:
-	for (i = 0; i < pd->total_domains; i++) {
-		if (notifier[i].handle)
-			service_notif_unregister_notifier(notifier[i].handle,
-					&priv->service_notifier_nb);
-	}
+	for (i = 0; i < registered; i++)
+		service_notif_unregister_notifier(
+				notifier[i].handle, &notifier[i].nb);
 	kfree(notifier);
 
 out:

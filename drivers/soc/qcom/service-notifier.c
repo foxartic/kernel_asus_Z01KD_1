@@ -22,6 +22,7 @@
 #include <linux/of.h>
 #include <linux/err.h>
 #include <linux/uaccess.h>
+#include <linux/rcupdate.h>
 
 #include <soc/qcom/subsystem_restart.h>
 #include <soc/qcom/subsystem_notif.h>
@@ -696,6 +697,34 @@ EXPORT_SYMBOL(service_notif_pd_restart);
  *		 process.
  * notifier block: notifier callback for service events.
  */
+/* Registering the same notifier_block twice into one chain makes
+ * notifier_chain_register() link nb->next to itself (priority <= head),
+ * which turns every later notification into an infinite walk and leaves
+ * notif_add_lock held forever. Refuse the duplicate instead.
+ */
+static bool service_notif_nb_registered(struct service_notif_info *service_notif,
+					struct notifier_block *nb)
+{
+	struct srcu_notifier_head *nh = &service_notif->service_notif_rcvr_list;
+	struct notifier_block *entry;
+	bool found = false;
+	int idx;
+
+	mutex_lock(&nh->mutex);
+	idx = srcu_read_lock(&nh->srcu);
+	for (entry = rcu_dereference_raw(nh->head); entry;
+	     entry = rcu_dereference_raw(entry->next)) {
+		if (entry == nb) {
+			found = true;
+			break;
+		}
+	}
+	srcu_read_unlock(&nh->srcu, idx);
+	mutex_unlock(&nh->mutex);
+
+	return found;
+}
+
 void *service_notif_register_notifier(const char *service_path, int instance_id,
 				struct notifier_block *nb, int *curr_state)
 {
@@ -714,6 +743,12 @@ void *service_notif_register_notifier(const char *service_path, int instance_id,
 								curr_state);
 		if (IS_ERR(service_notif))
 			goto exit;
+	}
+
+	if (service_notif_nb_registered(service_notif, nb)) {
+		pr_err("Notifier already registered for %s\n", service_path);
+		service_notif = ERR_PTR(-EEXIST);
+		goto exit;
 	}
 
 	ret = srcu_notifier_chain_register(
