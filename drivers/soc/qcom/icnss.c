@@ -172,9 +172,10 @@ enum icnss_debug_quirks {
 	FW_REJUVENATE_ENABLE,
 };
 
-// Lineage: SSR_ONLY matches the boot cmdline value (icnss.quirks=416) so the
-// PDR/servreg livelock mitigation survives even without the cmdline.
-#define ICNSS_QUIRKS_DEFAULT		(BIT(VBATT_DISABLE) | \
+// Lineage: the defaults match the boot cmdline (icnss.quirks=417) so they survive without it.
+// SSR_ONLY avoids the PDR/servreg livelock; HW_ALWAYS_ON powers the WCNSS at probe.
+#define ICNSS_QUIRKS_DEFAULT		(BIT(HW_ALWAYS_ON) | \
+					 BIT(VBATT_DISABLE) | \
 					 BIT(FW_REJUVENATE_ENABLE) | \
 					 BIT(SSR_ONLY))
 
@@ -4570,6 +4571,12 @@ static int icnss_probe(struct platform_device *pdev)
 			     ret);
 
 	penv = priv;
+
+	if (test_bit(HW_ALWAYS_ON, &quirks)) {
+		ret = icnss_hw_power_on(priv);
+		if (ret)
+			icnss_pr_err("Failed to power on hardware: %d\n", ret);
+	}
 
 	icnss_pr_info("Platform driver probed successfully\n");
 
