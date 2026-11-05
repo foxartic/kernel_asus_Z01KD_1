@@ -83,6 +83,10 @@
 /* Maximum Allowed Size (128K) of Data Integrity Partition (DIP) for MDTP */
 #define MAX_DIP			0x20000
 
+/* A listener that dies mid-command can never answer; do not park the
+ * client on app_access_lock forever.
+ */
+#define QSEECOM_LSTNR_RESP_TIMEOUT_MS	20000
 #define RPMB_SERVICE			0x2000
 #define SSD_SERVICE			0x3000
 
@@ -1683,6 +1687,10 @@ static int __qseecom_process_incomplete_cmd(struct qseecom_dev_handle *data,
 	int ret = 0;
 	int rc = 0;
 	uint32_t lstnr;
+	bool answered = false;
+	bool interrupted = false;
+	unsigned long deadline;
+	unsigned long remaining;
 	unsigned long flags;
 	struct qseecom_client_listener_data_irsp send_data_rsp;
 	struct qseecom_client_listener_data_64bit_irsp send_data_rsp_64bit;
@@ -1740,35 +1748,52 @@ static int __qseecom_process_incomplete_cmd(struct qseecom_dev_handle *data,
 		/* block all signals */
 		sigprocmask(SIG_SETMASK, &new_sigset, &old_sigset);
 
+		pr_debug("%s: clnt %d app %s waits for lstnr svc %d data\n",
+			__func__, data->client.app_id,
+			(char *)data->client.app_name, lstnr);
+
+		deadline = jiffies + msecs_to_jiffies(QSEECOM_LSTNR_RESP_TIMEOUT_MS);
 		do {
-			/*
-			 * When reentrancy is not supported, check global
-			 * send_resp_flag; otherwise, check this listener's
-			 * send_resp_flag.
-			 */
-			if (!qseecom.qsee_reentrancy_support &&
-				!wait_event_freezable(qseecom.send_resp_wq,
-				__qseecom_listener_has_sent_rsp(data))) {
-					break;
+			long left;
+
+			if (fatal_signal_pending(current)) {
+				pr_err("%s: clnt %d signalled waiting on lstnr svc %d\n",
+					__func__, data->client.app_id, lstnr);
+				interrupted = true;
+				break;
 			}
 
-			if (qseecom.qsee_reentrancy_support &&
-				!wait_event_freezable(qseecom.send_resp_wq,
-				__qseecom_reentrancy_listener_has_sent_rsp(
-						data, ptr_svc))) {
-					break;
+			remaining = time_after(deadline, jiffies) ?
+					deadline - jiffies : 1;
+			if (qseecom.qsee_reentrancy_support) {
+				left = wait_event_freezable_timeout(qseecom.send_resp_wq,
+					__qseecom_reentrancy_listener_has_sent_rsp(data, ptr_svc),
+					remaining);
+				answered = __qseecom_reentrancy_listener_has_sent_rsp(data, ptr_svc);
+			} else {
+				left = wait_event_freezable_timeout(qseecom.send_resp_wq,
+					__qseecom_listener_has_sent_rsp(data),
+					remaining);
+				answered = __qseecom_listener_has_sent_rsp(data);
 			}
-		} while (1);
+
+			if (left < 0)
+				interrupted = true;
+		} while (!answered && !data->abort && !interrupted &&
+			 time_after(deadline, jiffies));
 
 		/* restore signal mask */
 		sigprocmask(SIG_SETMASK, &old_sigset, NULL);
-		if (data->abort) {
-			pr_err("Abort clnt %d waiting on lstnr svc %d, ret %d",
-				data->client.app_id, lstnr, ret);
-			rc = -ENODEV;
-			status = QSEOS_RESULT_FAILURE;
-		} else {
+		if (answered && !data->abort) {
 			status = QSEOS_RESULT_SUCCESS;
+			rc = 0;
+		} else {
+			rc = data->abort ? -ENODEV :
+			     (interrupted ? -ERESTARTSYS : -ETIMEDOUT);
+			pr_err("Abort clnt %d app %s waiting on lstnr svc %d, rc %d\n",
+				data->client.app_id, (char *)data->client.app_name,
+				lstnr, rc);
+			status = QSEOS_RESULT_FAILURE;
 		}
 
 		qseecom.send_resp_flag = 0;
