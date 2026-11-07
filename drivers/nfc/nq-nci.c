@@ -84,6 +84,7 @@ static int nfcc_reboot(struct notifier_block *notifier, unsigned long val,
 static int nqx_clock_select(struct nqx_dev *nqx_dev);
 /*clock disable function*/
 static int nqx_clock_deselect(struct nqx_dev *nqx_dev);
+int nfc_ioctl_power_states(struct file *filp, unsigned long arg);
 static struct notifier_block nfcc_notifier = {
 	.notifier_call	= nfcc_reboot,
 	.next			= NULL,
@@ -294,6 +295,11 @@ static int nfc_open(struct inode *inode, struct file *filp)
 	filp->private_data = nqx_dev;
 	nqx_init_stat(nqx_dev);
 
+	/* The Android 11 NXP stack never issues NFC_SET_PWR, so the NFCC stayed
+	 * unpowered and NACKed every i2c transfer to 0x28.  */
+	if (!nqx_dev->nfc_ven_enabled)
+		nfc_ioctl_power_states(filp, 1);
+
 	dev_dbg(&nqx_dev->client->dev,
 			"%s: %d,%d\n", __func__, imajor(inode), iminor(inode));
 	return ret;
@@ -460,12 +466,22 @@ static long nfc_ioctl(struct file *pfile, unsigned int cmd,
 	return r;
 }
 
+static int nfc_release(struct inode *inode, struct file *filp)
+{
+	struct nqx_dev *nqx_dev = filp->private_data;
+
+	if (nqx_dev != NULL && nqx_dev->nfc_ven_enabled)
+		nfc_ioctl_power_states(filp, 0);
+	return 0;
+}
+
 static const struct file_operations nfc_dev_fops = {
 	.owner = THIS_MODULE,
 	.llseek = no_llseek,
 	.read  = nfc_read,
 	.write = nfc_write,
 	.open = nfc_open,
+	.release = nfc_release,
 	.unlocked_ioctl = nfc_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = nfc_compat_ioctl
